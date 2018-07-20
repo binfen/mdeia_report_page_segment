@@ -1,0 +1,572 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+# TODO:
+
+from __future__ import print_function
+import shutil
+from pylab import *
+import os.path
+import cv2
+import math
+import PIL
+import glob
+import md5
+from PIL import Image
+from multiprocessing.dummy import Pool as ThreadPool
+import ocrolib
+from ocrolib import psegutils, morph, sl
+from ocrolib.toplevel import *
+import numpy as np
+from scipy import stats
+from ocrolib.common import read_image_gray
+from scipy.ndimage import interpolation, morphology
+from scipy.ndimage import filters
+
+#二值化
+def Binarization(fname):
+    def check_image(gray_img):
+        #页面安全检查
+        image = gray_img - np.amin(gray_img)
+        if np.amax(image) == np.amin(image):
+            return None
+        image /= np.amax(image)
+        image_temp = np.amax(image) - image
+        if len(image_temp.shape)==3 and np.mean(image_temp)<np.median(image_temp):
+            return None
+        h,w = image_temp.shape
+        if h<10 and h>10000 and w<10 and w>10000:
+            return None
+        return image
+    def adjust_whitelevel(image, zoom=0.5, perc=80, range=20):
+        #调整白平衡
+        extreme = (np.sum(image < 0.05) + np.sum(image > 0.95)) * 1.0 / np.prod(image.shape)
+        if extreme > 0.95:
+            flat = image
+        else:
+            m = interpolation.zoom(image, zoom)
+            m = filters.percentile_filter(m, perc, size=(range, 2))
+            m = filters.percentile_filter(m, perc, size=(2, range))
+            m = interpolation.zoom(m, 1.0/zoom)
+            w, h = np.minimum(np.array(image.shape), np.array(m.shape))
+            flat = np.clip(image[:w, :h]-m[:w, :h]+1, 0, 1)
+        return flat
+    def normalization(flat, lo=5, hi=95):
+        #归一化
+        v = filters.gaussian_filter(flat, e*20.0)
+        v = flat - v
+        v = filters.gaussian_filter(v**2, e*20.0)**0.5
+        v = (v>0.3*np.amax(v))
+        v = morphology.binary_dilation(v,structure=np.ones((20, 1)))
+        v = morphology.binary_dilation(v,structure=np.ones((1, 20)))
+
+        est = flat[v]
+        lo = stats.scoreatpercentile(est.ravel(), lo)
+        hi = stats.scoreatpercentile(est.ravel(), hi)
+        flat -= lo
+        flat /= (hi - lo)
+        flat = np.clip(flat, 0, 1)
+        return flat
+    def adjust_rotate(flat, bina):
+        #旋转调整
+        edges = (1 - bina).astype(np.uint8)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 200, minLineLength=200, maxLineGap=10)
+        if lines is not None:
+            lines1 = lines[:, 0, :]  # 提取为二维
+            angle_sum = 0
+            i = 0
+            angle = 0
+            if len(lines1) > 0:
+                for x1, y1, x2, y2 in lines1[:]:
+                    angle_line = (180 / np.pi) * (math.atan(1.0 * (y1 - y2) / (x2 - x1+1)))
+                    if angle_line > -45 and angle_line < 45 and angle_line != 0:
+                        angle_sum += angle_line
+                        i += 1
+                if i != 0:
+                    angle = 1.0 * angle_sum / i
+            flat = interpolation.rotate(flat, -angle, mode='constant',cval=1)
+            return flat
+    raw = read_image_gray(fname)
+    image = check_image(raw)
+    if image is None:
+        print('input image is invalid.')
+        return
+    flat = adjust_whitelevel(image)
+    flat = normalization(flat)
+    bina = 1*(flat > 0.6)
+    flat = adjust_rotate(flat, bina)
+    bina = 1 * (flat < 0.5)#黑底白字
+    return flat, bina
+
+#沿着水平横线分割求取最大区域
+def page_segment_horizontal_max(gray, binary):
+    height, width = binary.shape
+    edges = binary.astype(np.uint8)
+    horiz = np.zeros(shape=binary.shape)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 200, minLineLength=width / 3, maxLineGap=20)
+    if lines is not None:
+        lines1 = lines[:, 0, :]  # 提取为二维
+        for x1, y1, x2, y2 in lines1[:]:
+            angle = (180 / np.pi) * (math.atan(1.0 * (y1 - y2) / (x2 - x1 + 1)))
+            if angle > -10 and angle < 10:
+                horiz[min(y1, y2):max(y1, y2) + 1, min(x1, x2):max(x1, x2) + 1] = 1
+    number_index = np.sum(horiz, axis=1)
+    number_index = list(number_index)
+    text_index = [i for i, a in enumerate(number_index) if a==0]
+    if len(text_index) < 1:
+        return gray, binary
+    indexs = []
+    beg_index = text_index[0]
+    end_index = text_index[0]
+    for i in range(1, len(text_index)-1):
+        end_index = text_index[i]
+        if text_index[i] - text_index[i-1] != 1:
+            end_index = text_index[i-1]
+            indexs.append([beg_index, end_index])
+            beg_index = text_index[i]
+        indexs.append([beg_index, end_index])
+    max_height = 0
+    for index in indexs:
+        if index[1]-index[0] > max_height:
+            result_bina = binary[index[0]:index[1], :]
+            result_gray = gray[index[0]:index[1], :]
+            max_height = index[1]-index[0]
+    return result_gray, result_bina
+
+#计算垂直黑线位置
+def compute_colseps_black(binary,scale):
+    height, width = binary.shape
+    thick = filters.maximum_filter(binary, (1, scale / 2)) #最大值滤波：亮斑增大,暗斑减少
+    vert = morph.rb_opening(thick, (height / 2, 1))        #形态学开：去除孤立点,细化小物体边缘，平滑较大物体边缘
+    vert = morph.select_regions(vert, sl.dim0, min=height / 3, nbest=10)
+    indexs = np.sum(vert, axis=0)
+    indexs = list(1.0 * indexs / scale)
+    vert_index = [i for i, index in enumerate(indexs) if index > 2]
+    sep_black = np.zeros(shape=binary.shape)
+    if len(vert_index) > 0:
+        beg_index = vert_index[0]
+        end_index = vert_index[0]
+        for i in range(1, len(vert_index) - 1):
+            end_index = vert_index[i]
+            if vert_index[i] - vert_index[i - 1] != 1:
+                end_index = vert_index[i - 1]
+                if end_index - beg_index > scale / 5:
+                    sep_black[:, beg_index:end_index + 1] = 1
+                beg_index = vert_index[i]
+        sep_black[:, beg_index:end_index + 1] = 1
+    return sep_black
+
+#计算垂直白色空白位置
+def compute_colseps_white(binary, scale):
+    lines = morph.select_regions(binary, sl.dim1, min=10*scale, nbest=1000)
+    binary = binary - lines
+    h, w = binary.shape
+    thick = morph.rb_dilation(binary, (scale / 2, 1))
+    vert = morph.rb_erosion(thick, (scale / 2, 0))
+    vert = morph.select_regions(vert, sl.dim0, min=scale, nbest=1000)
+
+    indexs = np.sum(vert, axis=0)
+    indexs = list(1.0 * indexs / scale)
+    text_index = [i for i, index in enumerate(indexs) if index > 1]#文本位置
+    sep = np.zeros(shape=binary.shape)
+    if len(text_index) > 0:
+        beg_index = text_index[0]
+        end_index = text_index[0]
+        for i in range(1, len(text_index) - 1):
+            end_index = text_index[i]
+            if text_index[i] - text_index[i - 1] >scale / 2:
+                end_index = text_index[i - 1]
+                if end_index - beg_index > scale / 4:
+                    sep[:, beg_index:end_index+1] = 1
+                beg_index = text_index[i]
+        sep[:, beg_index:end_index + 1] = 1
+    sep = 1 - sep
+    return sep
+
+#计算文本区域的起始位置
+def compute_textregion_index(colseps):
+    height, width = colseps.shape
+    list_index = np.sum(colseps, axis=0)
+    text_index = [i for i, a in enumerate(list_index) if a == 0]
+    indexs = []
+    if len(text_index) > 0:
+        beg_index = text_index[0]
+        end_index = text_index[0]
+        for i in range(1, len(text_index) - 1):
+            end_index = text_index[i]
+            if text_index[i] - text_index[i - 1] != 1:
+                end_index = text_index[i - 1]
+                indexs.append([beg_index, end_index])
+                beg_index = text_index[i]
+        indexs.append([beg_index, end_index])
+    else:
+        beg_index = 0
+        end_index = width
+        indexs.append([beg_index, end_index])
+    return indexs
+
+#垂直分割：先黑线后空白区域
+def page_segment_vertical(gray, bina, scale):
+    # 计算垂直黑线区
+    height, width = bina.shape
+    edges = bina.astype(np.uint8)
+
+    colsep_black = np.zeros(shape=bina.shape)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 200, minLineLength=height / 4, maxLineGap=scale / 2)
+    if lines is not None:
+        lines1 = lines[:, 0, :]  # 提取为二维
+        for x1, y1, x2, y2 in lines1[:]:
+            angle = (180 / np.pi) * (math.atan(1.0 * (y1 - y2) / (x2 - x1 + 1)))
+            if angle > 80 or angle < -80:
+                colsep_black[min(y1, y2):max(y1, y2) + 1, min(x1, x2):max(x1, x2) + 1] = 1
+    indexs_black = compute_textregion_index(colsep_black)
+    indexs1 = []
+    for index in indexs_black:
+        if index[1] - index[0] >= 5 * scale:
+            indexs1.append(index)
+    bina_lists = []
+    gray_lists = []
+
+    # 计算垂直空白区
+    for i, index1 in enumerate(indexs1):
+        gray1 = gray[:, index1[0]:index1[1]]
+        bina1 = bina[:, index1[0]:index1[1]]
+        colsep_white = compute_colseps_white(bina1, scale)
+
+        indexs_white = compute_textregion_index(colsep_white)
+        indexs2 = []
+        for index in indexs_white:
+            if index[1] - index[0] >= 2 * scale:
+                indexs2.append(index)
+        for j, index2 in enumerate(indexs2):
+
+            gray2 = gray1[:, index2[0]:index2[1]]
+            bina2 = bina1[:, index2[0]:index2[1]]
+            gray_lists.append(gray2)
+            bina_lists.append(bina2)
+    return gray_lists, bina_lists
+
+#文本行分割
+def textline_segment(gray, bina, path, vert_num, dictionary):
+    height, width = gray.shape
+    scale = psegutils.estimate_scale(bina)
+    textlines = filters.maximum_filter(bina, (0, scale))
+
+    textlines = morph.rb_erosion(textlines, (3, 0))
+    textlines = morph.rb_dilation(textlines, (0, scale))
+    textpixe_num = np.sum(textlines, axis=1)
+    textpixe_num = 1 * ((1.0 * textpixe_num / scale) > 1)
+    textpixe_num = list(textpixe_num)
+    text_index = [i for i, a in enumerate(textpixe_num) if a == 1]
+    indexs = []
+    if len(text_index) > 0:
+        beg_index = text_index[0]
+        end_index = text_index[0]
+        for i in range(1, len(text_index) - 1):
+            if text_index[i] - text_index[i - 1] != 1:
+                end_index = text_index[i - 1]
+                indexs.append([beg_index, end_index])
+                beg_index = text_index[i]
+            end_index = text_index[i]
+        indexs.append([beg_index, end_index])
+
+        #选取有效的文本行
+        results_indexs = []
+        for index in indexs:
+            if index[1] - index[0] >= scale / 2:
+                results_indexs.append(index)
+
+        for i, index in enumerate(results_indexs):
+            top = index[0]
+            bottom = index[1]
+
+            key = '%d.%d.png' % (vert_num, i)
+            value = [top, bottom]
+            dictionary[key] = value
+
+            # binaline = bina[top:bottom + 1, :]
+            # binaline = 255-255 * binaline
+            # cv2.imwrite(os.path.join(path, '%d.%d.png' % (vert_num, i)), binaline)
+
+            grayline = gray[max(0, top - 5):min(height, bottom + 5), :]
+            grayline = 255 * grayline
+            cv2.imwrite(os.path.join(path, '%d.%d.png' % (vert_num, i)), grayline)
+
+        return dictionary, i
+
+#修改文件记录
+def modify_textline_dictionary(dic):
+    '''
+    方法：每次都检查第一行,然后删除，更新，重复直至dic为空，并返回一个新的dic_new
+    :param dic:
+    :return: dic_new
+    '''
+    def compute_col_number(dic):
+        #统计列总数目
+        col_num = 0
+        for i, key in enumerate(dic):
+            a, _, _ = key.split('.')
+            a = int(a)
+            if a > col_num:
+                col_num = a
+        col_num = col_num + 1
+        return col_num
+
+    def compute_row_number(dic, axis):
+        #统计每列中行总数目
+        row_num = 0
+        for key in dic:
+            a, b, _ = key.split('.')
+            a = int(a)
+            b = int(b)
+            if a == axis:
+                if b > row_num:
+                    row_num = b
+        row_num = row_num + 1
+        return row_num
+
+    def compute_first_textline(dic, axis=0):
+        #查找第axis行的最高文本框位置
+        first_top = 10000
+        for i, key in enumerate(dic):
+            value = dic[key]
+            _, b, _ = key.split('.')
+            b = int(b)
+            if b == axis:
+                if first_top > value[0]:
+                    first_top = value[0]
+                    key_first = key
+        return key_first
+
+    def compute_iou(bound_left, bound_right):
+        #计算两个框的重叠率
+        iou = 0
+        if bound_left[0] < bound_right[0]:
+            left = bound_left
+            right = bound_right
+        else:
+            left = bound_right
+            right = bound_left
+
+        if right[0] > left[1]:
+            return iou
+        else:
+            iou = 1
+            return iou
+
+    def adjument_column_dictionary(dic, col):
+        #调整每列的记录：　此列中的所有行记录值减一
+        row_num = compute_row_number(dic, col)
+        for row in range(1, row_num):
+            key = '%d.%d.png' % (col, row)
+            if dic.has_key(key):
+                value = dic[key]
+                del dic[key]
+                key_new = str(col) + '.' + str(row - 1) + '.png'
+                dic[key_new] = value
+        return dic
+
+    def update_dictionary(dic_new, dic, ite, key_first, col_num, adjument_num):
+        #通过将每行中排序正确的文本行删除来更新字典
+        bound_left = dic[key_first]
+        for i in range(col_num):
+            key = '%d.0.png' % i
+            key_old = '%d.%d.png' % (i, adjument_num[i])
+            if dic.has_key(key):
+                bound_right = dic[key]
+                iou = compute_iou(bound_left, bound_right)
+                if iou:
+                    del dic[key]
+                    value = '%d.%d.png' % (i, ite)
+                    dic_new[key_old] = value
+                    dic = adjument_column_dictionary(dic, i)
+                    adjument_num[i] += 1
+        return dic_new, dic
+
+    col_num = compute_col_number(dic)
+    dic_new = {}
+    adjument_num = [0] * 20 #每列调整次数，以列表形式记录
+    ite = 0 # 更新操作进行到第几行，最终应该与最大行数相同　
+    while dic:
+        key_first= compute_first_textline(dic)
+        dic_new, dic = update_dictionary(dic_new, dic, ite, key_first, col_num, adjument_num)
+        ite += 1
+
+    return dic_new
+
+#预处理图像
+def parallel_process(fname):
+    pad_size = [3, 3, 3, 3]
+    ratio = 2
+    def pad_image():
+        PAD_TOP, PAD_LEFT, PAD_BOTTOM, PAD_RIGHT = pad_size
+        old_im = Image.open(fname)  # RGB
+        new_size = (old_im.size[0] + PAD_LEFT + PAD_RIGHT, old_im.size[1] + PAD_TOP + PAD_BOTTOM)
+        new_im = Image.new("RGB", new_size, (255, 255, 255))
+        new_im.paste(old_im, (PAD_LEFT, PAD_TOP))
+        new_im.save(fname)
+        return True
+    def downsample_image():
+        assert ratio >= 1, ratio
+        if ratio == 1:
+            return True
+        old_im = Image.open(fname)
+        old_size = old_im.size
+
+        if old_size[0] > 160 and old_size[1] > 16:
+            new_size = (int(old_size[0] / ratio), int(old_size[1] / ratio))
+        else:
+            new_size = old_size
+        new_im = old_im.resize(new_size, PIL.Image.LANCZOS)
+        new_im.save(fname)
+        return True
+    pad_image()
+    downsample_image()
+
+#行列显示修改
+def modify_file_name(dic, max_col, max_row, save_path):
+    new_dic = modify_textline_dictionary(dic)
+    names = os.listdir(save_path)
+    save_path_temp = os.path.abspath(os.path.join(save_path, '../images_temp'))
+    if os.path.exists(save_path_temp):
+        shutil.rmtree(save_path_temp)
+    os.makedirs(save_path_temp)
+
+    for name in names:
+        old_path = os.path.abspath(os.path.join(save_path, name))
+        new_path = os.path.abspath(os.path.join(save_path_temp, new_dic[name]))
+        os.rename(old_path, new_path)
+    shutil.rmtree(save_path)
+    os.rename(save_path_temp, save_path)
+    name_list = os.listdir(save_path)
+    name_list.sort(key=lambda x :int(x.split('.')[0]))
+
+    # 列数量为: <=4(单栏);单栏顺序为:
+    if max_col <=4:
+        return
+
+    # 列数量为: 5(单栏);单栏顺序为: 代码, 名称, 结果, 单位, 参考值.
+    elif max_col == 5:
+        for old_name in name_list:
+            old_path = os.path.join(save_path, old_name)
+            a, b, c = old_name.split('.')
+            if int(a) > 0:
+                a = int(a) - 1
+                new_name = str(a) +'.' + str(b) + '.' + c
+                new_path = os.path.join(save_path, new_name)
+                os.rename(old_path, new_path)
+
+    # 列数量为: 6(单栏);单栏顺序为: 序号, 代码, 名称, 结果, 单位, 参考值.
+    elif max_col == 6:
+        for old_name in name_list:
+            old_path = os.path.join(save_path, old_name)
+            a, b, c = old_name.split('.')
+            if int(a) > 1:
+                a = int(a) - 2
+                new_name = str(a) + '.' + str(b) + '.' + c
+                new_path = os.path.join(save_path, new_name)
+                os.rename(old_path, new_path)
+
+    #列数量为: 8(双栏);单栏顺序为:名称, 结果, 单位, 参考值.
+    elif max_col == 8:
+        for old_name in name_list:
+            old_path = os.path.join(save_path, old_name)
+            a, b, c = old_name.split('.')
+            if int(a) > 3:
+                a = int(a) - 4
+                b = int(b) + max_row
+                new_name = str(a) +'.' + str(b) + '.' + c
+                new_path = os.path.join(save_path, new_name)
+                os.rename(old_path, new_path)
+
+    # 列数量为: 10(双栏);单栏顺序为:代码,名称,结果,单位,参考值.
+    elif max_col == 10:
+        for old_name in name_list:
+            old_path = os.path.join(save_path, old_name)
+            a, b, c = old_name.split('.')
+            if int(a) > 0 and int(a) < 5:
+                a = int(a) - 1
+                new_name = str(a) + '.' + str(b) + '.' + c
+                new_path = os.path.join(save_path, new_name)
+                os.rename(old_path, new_path)
+            elif int(a) > 5 and int(a) < max_col:
+                a = int(a) - 6
+                b = int(b) + max_row
+                new_name = str(a) + '.' + str(b) + '.' + c
+                new_path = os.path.join(save_path, new_name)
+                os.rename(old_path, new_path)
+            else:
+                os.remove(old_path)
+
+    #列数量为: 12(双栏);单栏顺序为:序号,代码,名称,结果,单位,参考值.
+    elif max_col ==12:
+        for old_name in name_list:
+            old_path = os.path.join(save_path, old_name)
+            a, b, c = old_name.split('.')
+            if int(a) > 1 and int(a) < 6:
+                a = int(a) - 2
+                new_name = str(a) +'.' + str(b) + '.' + c
+                new_path = os.path.join(save_path, new_name)
+                os.rename(old_path, new_path)
+            elif int(a) > 7 and int(a) < max_col:
+                a = int(a) - 8
+                b = int(b) + max_row
+                new_name = str(a) + '.' + str(b) + '.' + c
+                new_path = os.path.join(save_path, new_name)
+                os.rename(old_path, new_path)
+            else:
+                os.remove(old_path)
+
+#分割主函数
+def Segment(fname, save_path):
+    # 清理上次执行的缓存结果
+    if os.path.exists(save_path):
+        shutil.rmtree(save_path)
+    os.makedirs(save_path)
+
+    #二值化
+    gray, bina = Binarization(fname)
+
+    #截取最大的文本区域作文待检测区域
+    bina = ocrolib.remove_noise(bina, 8)
+    scale = psegutils.estimate_scale(bina)
+    gray_max, bina_max = page_segment_horizontal_max(gray, bina)
+
+    #页面垂直分割：先黑线后空白区域
+    gray_lists1, bina_list1 = page_segment_vertical(gray_max, bina_max, scale)
+
+    #文本行分割
+    dic = {}
+    max_col = 0
+    max_row = 0
+    for j, bina1 in enumerate(bina_list1):
+        if j > max_col:
+            max_col = j
+        gray1 = gray_lists1[j]
+        dic, row = textline_segment(gray1, bina1, save_path, j, dic)
+        if row > max_row:
+            max_row = row
+    max_col += 1
+    max_row += 1
+
+    modify_file_name(dic, max_col, max_row, save_path)
+
+
+    #生成预测数据格式
+    # filenames = glob.glob((save_path + '/*.png'))
+    # pool = ThreadPool(8)
+    # _ = pool.map(parallel_process,  [name for name in filenames])
+    # pool.close()
+    # pool.join()
+    #
+    # file_name = open(os.path.abspath(os.path.join(save_path, '../test_filter.lst')), 'w')
+    # names_new = os.listdir(save_path)
+    # for i, name in enumerate(names_new):
+    #     file_name.write('%s %s\n' % (name, i))
+    # file_name.close()
+
+if __name__ == '__main__':
+    fname = os.path.abspath(os.path.join(os.getcwd(),'../test-sets/5.jpg'))
+    print(os.getcwd())
+    print(fname)
+    out_path = '../../data'
+    Segment(fname, out_path)
